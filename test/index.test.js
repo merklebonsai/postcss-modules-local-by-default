@@ -2168,6 +2168,15 @@ html {
 }
 `,
   },
+  // Body-less @scope at-rules (e.g. `@scope (.foo);`) have `atRule.nodes`
+  // === undefined; the unconditional `atRule.nodes.forEach(...)` in the
+  // @scope branch threw `Cannot read properties of undefined`. The
+  // non-scope at-rule branch has the same guard.
+  {
+    name: "@scope at-rule — body-less @scope no longer crashes",
+    input: `@scope (.foo);`,
+    expected: `@scope (:local(.foo));`,
+  },
   // The `to` keyword is case-insensitive per CSS keyword rules.
   {
     name: "@scope at-rule — uppercase TO keyword (#90)",

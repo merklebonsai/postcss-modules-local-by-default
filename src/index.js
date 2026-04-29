@@ -771,15 +771,20 @@ module.exports = (options = {}) => {
                 }
               }
 
-              atRule.nodes.forEach((declaration) => {
-                if (declaration.type === "decl") {
-                  localizeDeclaration(declaration, {
-                    localAliasMap,
-                    options: options,
-                    global: globalMode,
-                  });
-                }
-              });
+              // Guard matches the non-scope branch below — body-less @scope
+              // at-rules (or postcss-misparsed inputs) have undefined .nodes;
+              // unconditional forEach crashes.
+              if (atRule.nodes) {
+                atRule.nodes.forEach((declaration) => {
+                  if (declaration.type === "decl") {
+                    localizeDeclaration(declaration, {
+                      localAliasMap,
+                      options: options,
+                      global: globalMode,
+                    });
+                  }
+                });
+              }
             } else if (atRule.nodes) {
               atRule.nodes.forEach((declaration) => {
                 if (declaration.type === "decl") {
