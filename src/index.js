@@ -38,100 +38,38 @@ function getIgnoreComment(node) {
   }
 }
 
-// Parse @scope at-rule params into scope-start / scope-end clauses.
-// Grammar: <scope-start>? (to <scope-end>)?  where each clause is "(...)".
-// Tracks paren depth, string literals, CSS comments, and identifier escapes
-// so the "to" keyword is detected at the structural position rather than
-// matched as a substring. Returns null on unparseable input. Fixes #90.
+// Parse `@scope (start)? (to (end))?` params (#90). Uses postcss-value-parser
+// to tokenize parens, strings, escapes, and comments correctly. Quirk: `to(...)`
+// with no whitespace parses as one function — we split it back so all spacings
+// reduce to the same three grammar shapes.
 function parseScopeParams(params) {
-  const len = params.length;
-  let i = 0;
+  const nodes = valueParser(params)
+    .nodes.filter((n) => n.type !== "space")
+    .flatMap((n) =>
+      n.type === "function" && n.value.toLowerCase() === "to"
+        ? [
+            { type: "word", value: "to" },
+            { ...n, value: "" },
+          ]
+        : [n]
+    );
 
-  const skipWs = () => {
-    while (i < len) {
-      if (/\s/.test(params[i])) {
-        i++;
-      } else if (params[i] === "/" && params[i + 1] === "*") {
-        const close = params.indexOf("*/", i + 2);
-        if (close === -1) return false;
-        i = close + 2;
-      } else {
-        return true;
-      }
-    }
-    return true;
-  };
+  const isParen = (n) => n && n.type === "function" && n.value === "";
+  const isTo = (n) => n && n.type === "word" && n.value.toLowerCase() === "to";
+  const inner = (n) => valueParser.stringify(n.nodes);
 
-  // Read inner contents of `(...)` at position i; advance i past `)`.
-  // Tracks paren depth, string literals (with backslash escapes), CSS
-  // comments, and CSS ident escapes (`\(`, `\)`, etc.).
-  const readParens = () => {
-    if (params[i] !== "(") return null;
-    let depth = 1;
-    let j = i + 1;
-    let inStr = null;
-    while (j < len && depth > 0) {
-      const c = params[j];
-      if (inStr) {
-        if (c === "\\") {
-          j += 2; // skip the escaped char (incl. closing quote, newline, etc.)
-          continue;
-        }
-        if (c === inStr) inStr = null;
-        j++;
-      } else if (c === "\\") {
-        j += 2; // CSS ident escape — the next char is literal, ignore parens
-      } else if (c === "/" && params[j + 1] === "*") {
-        const close = params.indexOf("*/", j + 2);
-        if (close === -1) return null;
-        j = close + 2;
-      } else if (c === '"' || c === "'") {
-        inStr = c;
-        j++;
-      } else if (c === "(") {
-        depth++;
-        j++;
-      } else if (c === ")") {
-        depth--;
-        j++;
-      } else {
-        j++;
-      }
-    }
-    if (depth !== 0) return null;
-    const inner = params.slice(i + 1, j - 1);
-    i = j;
-    return inner;
-  };
-
-  if (!skipWs()) return null;
-  let start = null;
-  let end = null;
-
-  if (params[i] === "(") {
-    start = readParens();
-    if (start === null) return null;
-    if (!skipWs()) return null;
-  }
-
-  if (i < len) {
-    // Expect "to" keyword (case-insensitive per CSS) followed by `(scope-end)`.
-    if (params.slice(i, i + 2).toLowerCase() !== "to") return null;
-    // Boundary check: the char after "to" must be whitespace, "(", or
-    // start-of-comment. Empty fallback is safe: if "to" is at end-of-input
-    // with no trailing context, the subsequent paren check rejects it.
-    const next = i + 2 < len ? params[i + 2] : "";
-    if (next !== "" && !/\s|\(/.test(next) && next !== "/") return null;
-    i += 2;
-    if (!skipWs()) return null;
-    if (params[i] !== "(") return null;
-    end = readParens();
-    if (end === null) return null;
-    if (!skipWs()) return null;
-    if (i < len) return null; // trailing garbage
-  }
-
-  return { start, end };
+  if (nodes.length === 1 && isParen(nodes[0]))
+    return { start: inner(nodes[0]), end: null };
+  if (nodes.length === 2 && isTo(nodes[0]) && isParen(nodes[1]))
+    return { start: null, end: inner(nodes[1]) };
+  if (
+    nodes.length === 3 &&
+    isParen(nodes[0]) &&
+    isTo(nodes[1]) &&
+    isParen(nodes[2])
+  )
+    return { start: inner(nodes[0]), end: inner(nodes[2]) };
+  return null;
 }
 
 function normalizeNodeArray(nodes) {
@@ -709,88 +647,60 @@ module.exports = (options = {}) => {
                   global: globalKeyframes,
                 });
               });
-            } else if (/scope$/i.test(atRule.name)) {
-              if (atRule.params) {
-                const ignoreComment = pureMode
-                  ? getIgnoreComment(atRule)
-                  : undefined;
+              return;
+            }
 
-                if (ignoreComment) {
-                  ignoreComment.remove();
-                }
+            if (/scope$/i.test(atRule.name) && atRule.params) {
+              const ignoreComment = pureMode && getIgnoreComment(atRule);
+              if (ignoreComment) ignoreComment.remove();
 
-                const parsed = parseScopeParams(atRule.params);
-                if (!parsed) {
-                  atRule.warn(
-                    result,
-                    "Could not parse @scope params; selectors will not be " +
-                      "localized for this rule. Params: " +
-                      JSON.stringify(atRule.params)
+              const parsed = parseScopeParams(atRule.params);
+              if (!parsed) {
+                atRule.warn(
+                  result,
+                  `Could not parse @scope params; selectors will not be localized. Params: ${JSON.stringify(
+                    atRule.params
+                  )}`
+                );
+              } else {
+                const localize = (selector) => {
+                  const context = localizeNode(
+                    selector.trim(),
+                    options.mode,
+                    localAliasMap
                   );
-                }
-                if (parsed) {
-                  const localizeSelector = (selector) => {
-                    const context = localizeNode(
-                      selector,
-                      options.mode,
-                      localAliasMap
+                  if (
+                    enforcePureMode &&
+                    context.hasPureGlobals &&
+                    !ignoreComment
+                  ) {
+                    throw atRule.error(
+                      'Selector in at-rule"' +
+                        selector +
+                        '" is not pure ' +
+                        "(pure selectors must contain at least one local class or id)"
                     );
-                    context.options = options;
-                    context.localAliasMap = localAliasMap;
-                    if (
-                      enforcePureMode &&
-                      context.hasPureGlobals &&
-                      !ignoreComment
-                    ) {
-                      throw atRule.error(
-                        'Selector in at-rule"' +
-                          selector +
-                          '" is not pure ' +
-                          "(pure selectors must contain at least one local class or id)"
-                      );
-                    }
-                    return context.selector;
-                  };
-
-                  const start =
-                    parsed.start !== null
-                      ? localizeSelector(parsed.start.trim())
-                      : null;
-                  const end =
-                    parsed.end !== null
-                      ? localizeSelector(parsed.end.trim())
-                      : null;
-
-                  if (start !== null && end !== null) {
-                    atRule.params = `(${start}) to (${end})`;
-                  } else if (start !== null) {
-                    atRule.params = `(${start})`;
-                  } else if (end !== null) {
-                    atRule.params = `to (${end})`;
                   }
-                }
+                  return context.selector;
+                };
+                atRule.params = [
+                  parsed.start !== null && `(${localize(parsed.start)})`,
+                  parsed.end !== null && `to (${localize(parsed.end)})`,
+                ]
+                  .filter(Boolean)
+                  .join(" ");
               }
+            }
 
-              // Guard matches the non-scope branch below — body-less @scope
-              // at-rules (or postcss-misparsed inputs) have undefined .nodes;
-              // unconditional forEach crashes.
-              if (atRule.nodes) {
-                atRule.nodes.forEach((declaration) => {
-                  if (declaration.type === "decl") {
-                    localizeDeclaration(declaration, {
-                      localAliasMap,
-                      options: options,
-                      global: globalMode,
-                    });
-                  }
-                });
-              }
-            } else if (atRule.nodes) {
+            // Localize decls in the at-rule body. Shallow on purpose — nested
+            // rules are picked up by walkRules below. Body-less at-rules
+            // (e.g. `@scope (.foo);`) have undefined .nodes.
+            if (atRule.nodes) {
               atRule.nodes.forEach((declaration) => {
                 if (declaration.type === "decl") {
                   localizeDeclaration(declaration, {
                     localAliasMap,
-                    options: options,
+                    options,
                     global: globalMode,
                   });
                 }
